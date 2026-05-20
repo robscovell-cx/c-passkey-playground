@@ -49,6 +49,71 @@ function checkSupport(statusId) {
   return true;
 }
 
+/* ---- Shared: build assertion payload from a WebAuthn assertion --------- */
+
+function buildAssertionPayload(assertion) {
+  return {
+    id:    assertion.id,
+    rawId: bufferToBase64url(assertion.rawId),
+    type:  assertion.type,
+    response: {
+      authenticatorData: bufferToBase64url(assertion.response.authenticatorData),
+      clientDataJSON:    bufferToBase64url(assertion.response.clientDataJSON),
+      signature:         bufferToBase64url(assertion.response.signature),
+      userHandle: assertion.response.userHandle
+        ? bufferToBase64url(assertion.response.userHandle) : null,
+    },
+  };
+}
+
+/* ---- Shared: complete an authentication assertion ----------------------- */
+
+async function completeAuth(assertion, statusId) {
+  const result = await apiPost('/api/auth/complete', buildAssertionPayload(assertion));
+  if (!result.ok) throw new Error(result.error || 'Authentication failed');
+  setStatus(statusId, `Logged in as ${result.username}! Token: ${result.token}`, true);
+}
+
+/* ---- Conditional UI (autofill) ----------------------------------------- */
+
+let conditionalAbort = null;
+
+async function initConditionalUI() {
+  if (!window.PublicKeyCredential) return;
+
+  /* isConditionalMediationAvailable is not available in all browsers */
+  const available = await (PublicKeyCredential.isConditionalMediationAvailable?.() ?? false);
+  if (!available) return;
+
+  try {
+    /* Get a server challenge with no username — returns empty allowCredentials */
+    const options = await apiPost('/api/auth/begin', {});
+    options.challenge = base64urlToBuffer(options.challenge);
+    if (options.allowCredentials) {
+      options.allowCredentials = options.allowCredentials.map(c => ({
+        ...c, id: base64urlToBuffer(c.id),
+      }));
+    }
+
+    conditionalAbort = new AbortController();
+
+    /* This promise is long-lived: it resolves only when the user selects a
+       passkey from the browser autofill dropdown on the username input field. */
+    const assertion = await navigator.credentials.get({
+      publicKey: options,
+      mediation: 'conditional',
+      signal:    conditionalAbort.signal,
+    });
+
+    await completeAuth(assertion, 'auth-status');
+  } catch (e) {
+    /* AbortError is expected when the button flow takes over — ignore it */
+    if (e.name !== 'AbortError') {
+      setStatus('auth-status', 'Error: ' + e.message, false);
+    }
+  }
+}
+
 /* ---- Registration ------------------------------------------------------- */
 
 document.getElementById('reg-btn').addEventListener('click', async () => {
@@ -60,10 +125,8 @@ document.getElementById('reg-btn').addEventListener('click', async () => {
   setStatus('reg-status', 'Starting registration…', true);
 
   try {
-    /* 1. Begin — get options from server */
     const options = await apiPost('/api/register/begin', { username });
 
-    /* 2. Transform: decode base64url fields to ArrayBuffer */
     options.challenge = base64urlToBuffer(options.challenge);
     options.user.id   = base64urlToBuffer(options.user.id);
     if (options.excludeCredentials) {
@@ -72,10 +135,8 @@ document.getElementById('reg-btn').addEventListener('click', async () => {
       }));
     }
 
-    /* 3. Browser WebAuthn API */
     const cred = await navigator.credentials.create({ publicKey: options });
 
-    /* 4. Serialize response buffers to base64url */
     const payload = {
       id:    cred.id,
       rawId: bufferToBase64url(cred.rawId),
@@ -87,7 +148,6 @@ document.getElementById('reg-btn').addEventListener('click', async () => {
       },
     };
 
-    /* 5. Complete — send to server */
     const result = await apiPost('/api/register/complete', payload);
     if (!result.ok) throw new Error(result.error || 'Registration failed');
 
@@ -97,21 +157,22 @@ document.getElementById('reg-btn').addEventListener('click', async () => {
   }
 });
 
-/* ---- Authentication ----------------------------------------------------- */
+/* ---- Authentication (button-initiated) ---------------------------------- */
 
 document.getElementById('auth-btn').addEventListener('click', async () => {
   if (!checkSupport('auth-status')) return;
 
-  const username = document.getElementById('auth-username').value.trim();
-  if (!username) { setStatus('auth-status', 'Enter a username.', false); return; }
+  /* Abort any in-flight conditional request before starting our own */
+  conditionalAbort?.abort();
+  conditionalAbort = null;
 
+  const username = document.getElementById('auth-username').value.trim();
   setStatus('auth-status', 'Starting authentication…', true);
 
   try {
-    /* 1. Begin */
-    const options = await apiPost('/api/auth/begin', { username });
+    /* Send username if provided (named flow); omit for immediate discoverable modal */
+    const options = await apiPost('/api/auth/begin', username ? { username } : {});
 
-    /* 2. Transform */
     options.challenge = base64urlToBuffer(options.challenge);
     if (options.allowCredentials) {
       options.allowCredentials = options.allowCredentials.map(c => ({
@@ -119,30 +180,13 @@ document.getElementById('auth-btn').addEventListener('click', async () => {
       }));
     }
 
-    /* 3. Browser API */
     const assertion = await navigator.credentials.get({ publicKey: options });
-
-    /* 4. Serialize */
-    const payload = {
-      id:    assertion.id,
-      rawId: bufferToBase64url(assertion.rawId),
-      type:  assertion.type,
-      response: {
-        authenticatorData: bufferToBase64url(assertion.response.authenticatorData),
-        clientDataJSON:    bufferToBase64url(assertion.response.clientDataJSON),
-        signature:         bufferToBase64url(assertion.response.signature),
-        userHandle: assertion.response.userHandle
-          ? bufferToBase64url(assertion.response.userHandle) : null,
-      },
-    };
-
-    /* 5. Complete */
-    const result = await apiPost('/api/auth/complete', payload);
-    if (!result.ok) throw new Error(result.error || 'Authentication failed');
-
-    setStatus('auth-status',
-      `Logged in as ${result.username}! Token: ${result.token}`, true);
+    await completeAuth(assertion, 'auth-status');
   } catch (e) {
     setStatus('auth-status', 'Error: ' + e.message, false);
   }
 });
+
+/* ---- Boot --------------------------------------------------------------- */
+
+initConditionalUI();
