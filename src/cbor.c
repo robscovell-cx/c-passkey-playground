@@ -33,31 +33,31 @@ int cbor_decode_one(const uint8_t *buf, size_t len, cbor_value_t *out) {
 
     switch (major) {
         case 0:  /* unsigned int */
-            out->uint = val;
+            out->u.uint = val;
             return (int)hdr;
 
         case 1:  /* negative int: actual value = -1 - val */
-            out->negint = -1 - (int64_t)val;
+            out->u.negint = -1 - (int64_t)val;
             return (int)hdr;
 
         case 2:  /* byte string */
             if (hdr + val > len) return -1;
-            out->bytes.ptr = buf + hdr;
-            out->bytes.len = (size_t)val;
+            out->u.bytes.ptr = buf + hdr;
+            out->u.bytes.len = (size_t)val;
             return (int)(hdr + val);
 
         case 3:  /* text string */
             if (hdr + val > len) return -1;
-            out->text.ptr = (const char *)(buf + hdr);
-            out->text.len = (size_t)val;
+            out->u.text.ptr = (const char *)(buf + hdr);
+            out->u.text.len = (size_t)val;
             return (int)(hdr + val);
 
         case 4:  /* array */
-            out->array_len = val;
+            out->u.array_len = val;
             return (int)hdr;
 
         case 5:  /* map */
-            out->map_len = val;
+            out->u.map_len = val;
             return (int)hdr;
 
         default:
@@ -74,7 +74,7 @@ int cbor_skip(const uint8_t *buf, size_t len) {
     size_t off = (size_t)consumed;
 
     if (v.type == CBOR_MAP) {
-        for (uint64_t i = 0; i < v.map_len * 2; i++) {
+        for (uint64_t i = 0; i < v.u.map_len * 2; i++) {
             int n = cbor_skip(buf + off, len - off);
             if (n < 0) return -1;
             off += (size_t)n;
@@ -83,7 +83,7 @@ int cbor_skip(const uint8_t *buf, size_t len) {
     }
 
     if (v.type == CBOR_ARRAY) {
-        for (uint64_t i = 0; i < v.array_len; i++) {
+        for (uint64_t i = 0; i < v.u.array_len; i++) {
             int n = cbor_skip(buf + off, len - off);
             if (n < 0) return -1;
             off += (size_t)n;
@@ -109,36 +109,36 @@ int cbor_parse_attestation_object(const uint8_t *buf, size_t len,
 
     size_t off = (size_t)hdr_sz;
 
-    for (uint64_t i = 0; i < map_hdr.map_len; i++) {
+    for (uint64_t i = 0; i < map_hdr.u.map_len; i++) {
         cbor_value_t key;
         int ksz = cbor_decode_one(buf + off, len - off, &key);
         if (ksz < 0) return -1;
         off += (size_t)ksz;
 
         if (key.type == CBOR_TEXT) {
-            size_t klen = key.text.len;
+            size_t klen = key.u.text.len;
 
-            if (klen == 3 && memcmp(key.text.ptr, "fmt", 3) == 0) {
+            if (klen == 3 && memcmp(key.u.text.ptr, "fmt", 3) == 0) {
                 cbor_value_t val;
                 int vsz = cbor_decode_one(buf + off, len - off, &val);
                 if (vsz < 0) return -1;
                 if (val.type == CBOR_TEXT && fmt_cap > 0) {
-                    size_t copy = val.text.len < fmt_cap - 1
-                                  ? val.text.len : fmt_cap - 1;
-                    memcpy(fmt_out, val.text.ptr, copy);
+                    size_t copy = val.u.text.len < fmt_cap - 1
+                                  ? val.u.text.len : fmt_cap - 1;
+                    memcpy(fmt_out, val.u.text.ptr, copy);
                     fmt_out[copy] = '\0';
                 }
                 off += (size_t)vsz;
                 continue;
             }
 
-            if (klen == 8 && memcmp(key.text.ptr, "authData", 8) == 0) {
+            if (klen == 8 && memcmp(key.u.text.ptr, "authData", 8) == 0) {
                 cbor_value_t val;
                 int vsz = cbor_decode_one(buf + off, len - off, &val);
                 if (vsz < 0) return -1;
                 if (val.type == CBOR_BYTES) {
-                    *auth_data     = val.bytes.ptr;
-                    *auth_data_len = val.bytes.len;
+                    *auth_data     = val.u.bytes.ptr;
+                    *auth_data_len = val.u.bytes.len;
                 }
                 off += (size_t)vsz;
                 continue;
@@ -164,7 +164,7 @@ int cbor_parse_cose_key(const uint8_t *buf, size_t len,
     int    got_x = 0, got_y = 0;
     *alg_out = 0;
 
-    for (uint64_t i = 0; i < map_hdr.map_len; i++) {
+    for (uint64_t i = 0; i < map_hdr.u.map_len; i++) {
         cbor_value_t key;
         int ksz = cbor_decode_one(buf + off, len - off, &key);
         if (ksz < 0) return -1;
@@ -176,17 +176,17 @@ int cbor_parse_cose_key(const uint8_t *buf, size_t len,
 
         if (key.type == CBOR_UINT || key.type == CBOR_NEGINT) {
             int64_t k = (key.type == CBOR_UINT)
-                        ? (int64_t)key.uint : key.negint;
+                        ? (int64_t)key.u.uint : key.u.negint;
 
             if (k == 3) {
                 /* alg: -7 = ES256 */
-                if (val.type == CBOR_NEGINT) *alg_out = (int)val.negint;
-                else if (val.type == CBOR_UINT) *alg_out = (int)val.uint;
-            } else if (k == -2 && val.type == CBOR_BYTES && val.bytes.len == 32) {
-                memcpy(x, val.bytes.ptr, 32);
+                if (val.type == CBOR_NEGINT) *alg_out = (int)val.u.negint;
+                else if (val.type == CBOR_UINT) *alg_out = (int)val.u.uint;
+            } else if (k == -2 && val.type == CBOR_BYTES && val.u.bytes.len == 32) {
+                memcpy(x, val.u.bytes.ptr, 32);
                 got_x = 1;
-            } else if (k == -3 && val.type == CBOR_BYTES && val.bytes.len == 32) {
-                memcpy(y, val.bytes.ptr, 32);
+            } else if (k == -3 && val.type == CBOR_BYTES && val.u.bytes.len == 32) {
+                memcpy(y, val.u.bytes.ptr, 32);
                 got_y = 1;
             }
         }

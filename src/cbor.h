@@ -21,7 +21,7 @@ typedef struct {
         struct { const char    *ptr; size_t len; } text;
         uint64_t map_len;
         uint64_t array_len;
-    };
+    } u;
 } cbor_value_t;
 
 /* Decode one CBOR item header. Returns bytes consumed (>0), or -1 on error.

@@ -1,5 +1,5 @@
 CC      = clang
-CFLAGS  = -std=c11 -Wall -Wextra -g \
+CFLAGS  = -std=c99 -Wall -Wextra -g \
            -Ivendor -Isrc \
            -I/opt/homebrew/opt/openssl@3/include \
            -DMG_ENABLE_LOG=0
@@ -19,7 +19,7 @@ $(TARGET): $(OBJS)
 	$(CC) $(OBJS) $(LDFLAGS) -o $@
 
 vendor/sqlite3.o: vendor/sqlite3.c
-	$(CC) -std=c11 -O2 \
+	$(CC) -std=c99 -O2 \
 	  -DSQLITE_THREADSAFE=0 \
 	  -DSQLITE_DEFAULT_MEMSTATUS=0 \
 	  -c vendor/sqlite3.c -o vendor/sqlite3.o
