@@ -1,4 +1,6 @@
 passkey-server
 passkeys.db
+passkeys.db-shm
+passkeys.db-wal
 *.o
 /tmp/
