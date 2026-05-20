@@ -86,6 +86,28 @@ int db_user_find(db_ctx_t *ctx, const char *username, int64_t *out_user_id) {
     return rc;
 }
 
+int db_user_find_by_id(db_ctx_t *ctx, int64_t user_id,
+                       char *out_username, size_t uname_cap) {
+    const char *sql = "SELECT username FROM users WHERE id = ?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(ctx->db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+
+    sqlite3_bind_int64(stmt, 1, user_id);
+
+    int rc = -1;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *u = (const char *)sqlite3_column_text(stmt, 0);
+        if (u && uname_cap > 0) {
+            size_t copy = strlen(u) < uname_cap - 1 ? strlen(u) : uname_cap - 1;
+            memcpy(out_username, u, copy);
+            out_username[copy] = '\0';
+        }
+        rc = 0;
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
 /* ---- Credentials -------------------------------------------------------- */
 
 int db_cred_store(db_ctx_t *ctx, int64_t user_id,

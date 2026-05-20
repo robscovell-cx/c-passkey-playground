@@ -243,8 +243,9 @@ Issues identified during review of `frontend/app.js` and resolved:
 4. **Repetitive fetch boilerplate** — extracted shared `apiPost(endpoint, payload)` helper used by all four API calls.
 5. **Global scope pollution** — script tag changed to `type="module"`; all functions are now module-scoped.
 
-Not implemented (noted for future work):
-- **Conditional UI / discoverable credentials** — would require dropping the username field on `/api/auth/begin` and adding `mediation: "conditional"` on the front-end; needs backend changes.
+6. **Discoverable credentials backend** — `db_user_find_by_id()` added; `webauthn_begin_authentication()` now accepts NULL username (stores `""` challenge, returns empty `allowCredentials`); `webauthn_verify_authentication()` resolves username from credential when challenge carries no username; `handle_auth_begin()` makes username field optional.
+
+Frontend-side conditional UI (`mediation: "conditional"` on `navigator.credentials.get()`, optional username input) remains as future work.
 
 ---
 

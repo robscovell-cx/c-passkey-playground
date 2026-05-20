@@ -250,12 +250,18 @@ static void cred_list_cb(const uint8_t *cred_id, size_t len, void *ud) {
 
 cJSON *webauthn_begin_authentication(db_ctx_t *db, const char *username) {
     int64_t user_id = 0;
-    if (db_user_find(db, username, &user_id) != 0) return NULL;
+
+    /* username is optional — NULL triggers the discoverable credential flow */
+    if (username != NULL) {
+        if (db_user_find(db, username, &user_id) != 0) return NULL;
+    }
 
     uint8_t challenge[32];
     mg_random(challenge, sizeof(challenge));
 
-    if (db_challenge_store(db, challenge, username, "authentication",
+    /* Store "" for discoverable challenges (satisfies NOT NULL constraint) */
+    const char *stored_uname = username ? username : "";
+    if (db_challenge_store(db, challenge, stored_uname, "authentication",
                            (int64_t)time(NULL) + CHAL_TTL) != 0)
         return NULL;
 
@@ -269,8 +275,12 @@ cJSON *webauthn_begin_authentication(db_ctx_t *db, const char *username) {
     cJSON_AddStringToObject(opts, "userVerification", "preferred");
 
     cJSON *allow = cJSON_CreateArray();
-    cred_list_ctx_t cl = { .arr = allow };
-    db_creds_for_user(db, user_id, cred_list_cb, &cl);
+    if (username != NULL) {
+        /* Named flow: populate allowCredentials with the user's credential IDs */
+        cred_list_ctx_t cl = { .arr = allow };
+        db_creds_for_user(db, user_id, cred_list_cb, &cl);
+    }
+    /* Discoverable flow: leave allowCredentials empty — browser picks the passkey */
     cJSON_AddItemToObject(opts, "allowCredentials", allow);
 
     free(chal_b64);
@@ -368,6 +378,14 @@ char *webauthn_verify_authentication(db_ctx_t *db, cJSON *assertion,
         ERR("challenge not found or expired"); return NULL;
     }
     cJSON_Delete(cdj);
+
+    /* Discoverable flow: challenge stored with "" username — resolve from credential */
+    if (username[0] == '\0') {
+        if (db_user_find_by_id(db, user_id, username, sizeof(username)) != 0) {
+            free(cdj_buf); free(cred_id); free(pub_der);
+            ERR("could not resolve username from credential"); return NULL;
+        }
+    }
 
     /* --- Decode authenticatorData --- */
     const char *auth_str = auth_b64->valuestring;

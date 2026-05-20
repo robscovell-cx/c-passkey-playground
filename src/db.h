@@ -14,6 +14,8 @@ void db_close(db_ctx_t *ctx);
 int db_user_create(db_ctx_t *ctx, const char *username,
                    const char *display_name, int64_t *out_user_id);
 int db_user_find(db_ctx_t *ctx, const char *username, int64_t *out_user_id);
+int db_user_find_by_id(db_ctx_t *ctx, int64_t user_id,
+                       char *out_username, size_t uname_cap);
 
 /* Credentials
    db_cred_find: out_pubkey_der is heap-allocated — caller must free(). */

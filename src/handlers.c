@@ -74,12 +74,12 @@ static void handle_auth_begin(struct mg_connection *c,
     cJSON *req = parse_body(hm);
     if (!req) { reply_err(c, 400, "bad json"); return; }
 
-    cJSON *uname = cJSON_GetObjectItemCaseSensitive(req, "username");
-    if (!cJSON_IsString(uname) || !uname->valuestring[0]) {
-        cJSON_Delete(req); reply_err(c, 400, "missing username"); return;
-    }
+    /* username is optional — omitting it triggers the discoverable credential flow */
+    cJSON *uname_json = cJSON_GetObjectItemCaseSensitive(req, "username");
+    const char *uname = (cJSON_IsString(uname_json) && uname_json->valuestring[0])
+                        ? uname_json->valuestring : NULL;
 
-    cJSON *opts = webauthn_begin_authentication(db, uname->valuestring);
+    cJSON *opts = webauthn_begin_authentication(db, uname);
     cJSON_Delete(req);
     if (!opts) { reply_err(c, 404, "user not found or no credentials"); return; }
 
