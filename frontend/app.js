@@ -1,5 +1,3 @@
-'use strict';
-
 /* ---- Base64url helpers -------------------------------------------------- */
 
 function bufferToBase64url(buf) {
@@ -18,7 +16,7 @@ function base64urlToBuffer(b64) {
   return buf.buffer;
 }
 
-/* ---- Status helpers ----------------------------------------------------- */
+/* ---- Status helper ------------------------------------------------------ */
 
 function setStatus(id, msg, ok) {
   const el = document.getElementById(id);
@@ -26,9 +24,36 @@ function setStatus(id, msg, ok) {
   el.className = 'status ' + (ok ? 'ok' : 'err');
 }
 
+/* ---- API helper --------------------------------------------------------- */
+
+async function apiPost(endpoint, payload) {
+  const resp = await fetch(endpoint, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify(payload),
+  });
+  if (!resp.ok) {
+    const e = await resp.json().catch(() => ({}));
+    throw new Error(e.error || `Server error (${resp.status})`);
+  }
+  return resp.json();
+}
+
+/* ---- Feature detection -------------------------------------------------- */
+
+function checkSupport(statusId) {
+  if (!window.PublicKeyCredential) {
+    setStatus(statusId, 'Passkeys are not supported in this browser or context.', false);
+    return false;
+  }
+  return true;
+}
+
 /* ---- Registration ------------------------------------------------------- */
 
 document.getElementById('reg-btn').addEventListener('click', async () => {
+  if (!checkSupport('reg-status')) return;
+
   const username = document.getElementById('reg-username').value.trim();
   if (!username) { setStatus('reg-status', 'Enter a username.', false); return; }
 
@@ -36,16 +61,7 @@ document.getElementById('reg-btn').addEventListener('click', async () => {
 
   try {
     /* 1. Begin — get options from server */
-    const beginResp = await fetch('/api/register/begin', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ username }),
-    });
-    if (!beginResp.ok) {
-      const e = await beginResp.json().catch(() => ({}));
-      throw new Error(e.error || 'Server error during begin');
-    }
-    const options = await beginResp.json();
+    const options = await apiPost('/api/register/begin', { username });
 
     /* 2. Transform: decode base64url fields to ArrayBuffer */
     options.challenge = base64urlToBuffer(options.challenge);
@@ -67,16 +83,12 @@ document.getElementById('reg-btn').addEventListener('click', async () => {
       response: {
         attestationObject: bufferToBase64url(cred.response.attestationObject),
         clientDataJSON:    bufferToBase64url(cred.response.clientDataJSON),
+        transports: cred.response.getTransports ? cred.response.getTransports() : [],
       },
     };
 
     /* 5. Complete — send to server */
-    const completeResp = await fetch('/api/register/complete', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(payload),
-    });
-    const result = await completeResp.json();
+    const result = await apiPost('/api/register/complete', payload);
     if (!result.ok) throw new Error(result.error || 'Registration failed');
 
     setStatus('reg-status', 'Passkey registered! You can now log in.', true);
@@ -88,6 +100,8 @@ document.getElementById('reg-btn').addEventListener('click', async () => {
 /* ---- Authentication ----------------------------------------------------- */
 
 document.getElementById('auth-btn').addEventListener('click', async () => {
+  if (!checkSupport('auth-status')) return;
+
   const username = document.getElementById('auth-username').value.trim();
   if (!username) { setStatus('auth-status', 'Enter a username.', false); return; }
 
@@ -95,16 +109,7 @@ document.getElementById('auth-btn').addEventListener('click', async () => {
 
   try {
     /* 1. Begin */
-    const beginResp = await fetch('/api/auth/begin', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ username }),
-    });
-    if (!beginResp.ok) {
-      const e = await beginResp.json().catch(() => ({}));
-      throw new Error(e.error || 'Server error during begin');
-    }
-    const options = await beginResp.json();
+    const options = await apiPost('/api/auth/begin', { username });
 
     /* 2. Transform */
     options.challenge = base64urlToBuffer(options.challenge);
@@ -132,12 +137,7 @@ document.getElementById('auth-btn').addEventListener('click', async () => {
     };
 
     /* 5. Complete */
-    const completeResp = await fetch('/api/auth/complete', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(payload),
-    });
-    const result = await completeResp.json();
+    const result = await apiPost('/api/auth/complete', payload);
     if (!result.ok) throw new Error(result.error || 'Authentication failed');
 
     setStatus('auth-status',

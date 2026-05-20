@@ -205,17 +205,19 @@ Parse `--port` and `--db` argv args; `db_init`; `mg_mgr_init`; `mg_http_listen(.
 
 ### 8. frontend/index.html + app.js
 
-Two sections: Register and Login. No framework dependencies.
+Two sections: Register and Login. No framework dependencies. Script loaded as `type="module"` (strict mode + module scope, no global pollution).
 
 Key JS helpers:
 ```js
 function bufferToBase64url(buf) { /* Uint8Array → btoa → replace +/ with -_ → strip = */ }
 function base64urlToBuffer(b64) { /* replace -_ → +/ → pad → atob → Uint8Array → ArrayBuffer */ }
+async function apiPost(endpoint, payload) { /* shared fetch helper — checks resp.ok before .json() */ }
+function checkSupport(statusId) { /* guards on window.PublicKeyCredential before each flow */ }
 ```
 
-Registration flow: POST `/api/register/begin` → transform `challenge` and `user.id` fields to `ArrayBuffer` → `navigator.credentials.create({publicKey: options})` → serialize response buffers to base64url → POST `/api/register/complete`.
+Registration flow: `checkSupport` → `apiPost('/api/register/begin')` → transform `challenge` and `user.id` to `ArrayBuffer` → `navigator.credentials.create({publicKey: options})` → serialize buffers to base64url (including `getTransports()`) → `apiPost('/api/register/complete')`.
 
-Authentication flow: POST `/api/auth/begin` → transform `challenge` and `allowCredentials[].id` to `ArrayBuffer` → `navigator.credentials.get({publicKey: options})` → serialize → POST `/api/auth/complete`.
+Authentication flow: `checkSupport` → `apiPost('/api/auth/begin')` → transform `challenge` and `allowCredentials[].id` to `ArrayBuffer` → `navigator.credentials.get({publicKey: options})` → serialize → `apiPost('/api/auth/complete')`.
 
 ---
 
@@ -228,6 +230,21 @@ Authentication flow: POST `/api/auth/begin` → transform `challenge` and `allow
 5. **OpenSSL 3 API**: Use EVP high-level API (`d2i_PUBKEY_ex`, `EVP_DigestVerify*`) — no deprecated EC_KEY functions.
 6. **challenge in clientDataJSON**: The browser base64url-encodes the challenge when embedding it in clientDataJSON. Decode before comparing to DB value.
 7. **`db_cred_find` allocates**: Caller must `free(pub_key_der)` after use.
+
+---
+
+## QA Findings (applied)
+
+Issues identified during review of `frontend/app.js` and resolved:
+
+1. **WebAuthn feature detection** — added `checkSupport()` guard checking `window.PublicKeyCredential` at the start of each button handler; fails gracefully with a readable message on unsupported browsers or non-secure contexts.
+2. **Fragile JSON parsing on complete steps** — both complete steps now go through `apiPost()` which checks `resp.ok` before calling `.json()`, so a non-JSON 500 response no longer throws an opaque parse error.
+3. **Authenticator transports** — registration payload now includes `transports: cred.response.getTransports ? cred.response.getTransports() : []`, which is required by strict server libraries and improves future credential lookup.
+4. **Repetitive fetch boilerplate** — extracted shared `apiPost(endpoint, payload)` helper used by all four API calls.
+5. **Global scope pollution** — script tag changed to `type="module"`; all functions are now module-scoped.
+
+Not implemented (noted for future work):
+- **Conditional UI / discoverable credentials** — would require dropping the username field on `/api/auth/begin` and adding `mediation: "conditional"` on the front-end; needs backend changes.
 
 ---
 
