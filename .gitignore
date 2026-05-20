@@ -1,0 +1,4 @@
+passkey-server
+passkeys.db
+*.o
+/tmp/
