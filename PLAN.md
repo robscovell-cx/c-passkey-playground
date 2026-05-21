@@ -1,10 +1,10 @@
-# Plan: C Passkey Authentication Backend
+# C Passkey Authentication Backend — Project Reference
 
-## Context
+## Overview
 
-Build a passkey (WebAuthn/FIDO2) authentication backend in pure C with SQLite for persistence and a minimal HTML/JS frontend for browser testing. The repo is currently empty. The goal is a working, spec-compliant WebAuthn implementation that lets users register and authenticate with platform passkeys (Touch ID, Face ID, Windows Hello, etc.) against a localhost server.
-
----
+A passkey (WebAuthn/FIDO2) authentication backend in pure C with SQLite for persistence
+and a minimal HTML/JS frontend for browser testing. Implements full registration and
+authentication ceremonies including discoverable credentials (Conditional UI).
 
 ## Project Structure
 
@@ -28,18 +28,25 @@ c-passkey-playground/
     └── app.js
 ```
 
----
+## Build
+
+```bash
+make vendor-fetch   # download mongoose, cJSON, sqlite3 amalgamation
+make                # build passkey-server; .o files cleaned up automatically after linking
+./passkey-server    # serves on http://localhost:8080
+```
+
+**Compiler**: clang, `-std=c99 -Wall -Wextra`
+**Dependencies**: OpenSSL 3 (`brew install openssl@3`), vendored mongoose/cJSON/sqlite3
 
 ## Dependencies
 
-| Library | Purpose | How |
-|---------|---------|-----|
-| mongoose 7.x | HTTP server + static file serving | Vendored single-file |
-| cJSON | JSON parse/generate | Vendored single-file |
-| SQLite amalgamation | Persistence | Vendored, compiled directly |
-| OpenSSL 3 (libssl/libcrypto) | SHA-256, ECDSA-P256 verify | System (`brew install openssl`) |
-
----
+| Library             | Purpose                           | How          |
+|---------------------|-----------------------------------|--------------|
+| mongoose 7.x        | HTTP server + static file serving | Vendored     |
+| cJSON               | JSON parse/generate               | Vendored     |
+| SQLite amalgamation | Persistence                       | Vendored     |
+| OpenSSL 3           | SHA-256, ECDSA-P256 verify        | System (brew)|
 
 ## Database Schema
 
@@ -62,199 +69,128 @@ CREATE TABLE credentials (
 CREATE TABLE challenges (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   challenge BLOB NOT NULL,
-  username TEXT NOT NULL,
+  username TEXT NOT NULL,         -- empty string "" for discoverable flow
   type TEXT NOT NULL,             -- 'registration' or 'authentication'
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL     -- time(NULL) + 300
 );
 ```
 
----
+## API Endpoints
 
-## Implementation Plan (ordered by dependency)
+| Method  | Path                   | Description                                   |
+|---------|------------------------|-----------------------------------------------|
+| POST    | /api/register/begin    | Returns WebAuthn creation options             |
+| POST    | /api/register/complete | Verifies attestation, stores credential       |
+| POST    | /api/auth/begin        | Returns assertion options (username optional) |
+| POST    | /api/auth/complete     | Verifies assertion, returns username + token  |
+| OPTIONS | *                      | 204 with CORS headers (browser preflight)     |
+| GET/etc | (all others)           | Serves ./frontend/ static files               |
 
-### 1. Makefile
+`/api/auth/begin` accepts `{}` (no username) for the discoverable flow — returns empty
+`allowCredentials` so the browser discovers stored passkeys itself.
 
-- `CFLAGS`: `-std=c11 -Wall -Wextra -Ivendor -Isrc -I/opt/homebrew/opt/openssl@3/include`
-- `LDFLAGS`: `-L/opt/homebrew/opt/openssl@3/lib -lssl -lcrypto`
-- Compile `vendor/sqlite3.c` separately with `-DSQLITE_THREADSAFE=0 -O2`
-- `vendor-fetch` target: curl mongoose, cJSON, sqlite3 amalgamation
-- `all`, `clean` targets
+## Authentication Flows
 
-### 2. src/crypto.c — No dependencies on other src files
+Three paths coexist:
 
-**base64url_decode**: Table-driven; `-` → 62, `_` → 63; stop at `=` or end. Handles unpadded input. Cannot use mongoose's `mg_base64_decode` (standard base64 only).
+1. **Named flow** (username typed): POST `{username}` → `allowCredentials` populated →
+   browser shows only matching passkeys.
 
-**base64url_encode**: URL-safe alphabet, no padding (`=`).
+2. **Discoverable modal** (button, no username): POST `{}` → `allowCredentials:[]` →
+   browser shows all stored passkeys for the RP.
 
-**sha256**: `SHA256(in, in_len, out)` via `#include <openssl/sha.h>`.
+3. **Conditional UI / autofill**: `initConditionalUI()` arms a passive `get()` on page
+   load with `mediation:"conditional"`. The browser surfaces passkeys in the username
+   autofill dropdown without any user gesture. Cancelled via `AbortController` when the
+   button flow starts.
 
-**cose_key_to_der**: Builds 91-byte DER `SubjectPublicKeyInfo` for P-256 by prepending a hardcoded 27-byte prefix to the 32-byte x then 32-byte y coordinates:
+## Key Implementation Details
+
+### C99 Compatibility
+
+The CBOR value union is named (`.u`) for C99 — anonymous unions are C11-only:
+
+```c
+typedef struct {
+    cbor_type_t type;
+    union {
+        uint64_t uint;
+        int64_t  negint;
+        struct { const uint8_t *ptr; size_t len; } bytes;
+        struct { const char    *ptr; size_t len; } text;
+        uint64_t map_len;
+        uint64_t array_len;
+    } u;
+} cbor_value_t;
+```
+
+Access: `v.u.uint`, `v.u.bytes.ptr`, `v.u.map_len`, etc.
+
+### Discoverable Credentials (`src/db.h`, `src/webauthn.c`, `src/handlers.c`)
+
+- `db_user_find_by_id(ctx, user_id, out_username, cap)` — reverse lookup by user_id
+- `webauthn_begin_authentication(db, NULL)` — stores `""` as challenge username, returns
+  empty `allowCredentials` array
+- `webauthn_verify_authentication` — if `username[0]=='\0'` after consuming challenge,
+  resolves username via `db_user_find_by_id(db, user_id, ...)`
+
+### WebAuthn Registration (`webauthn_verify_registration`)
+
+1. Decode + parse clientDataJSON; verify `type=="webauthn.create"`, `origin==ORIGIN`
+2. Decode challenge from clientDataJSON; `db_challenge_consume` (atomic find+delete)
+3. Decode attestationObject (CBOR); `cbor_parse_attestation_object` → authData bytes
+4. Parse authData binary layout:
+   - `[0..31]`  rpIdHash — verify `== sha256("localhost")`
+   - `[32]`     flags — UP (0x01) and AT (0x40) must be set
+   - `[33..36]` signCount (big-endian uint32)
+   - `[37..52]` AAGUID (16 bytes)
+   - `[53..54]` credentialIdLength (big-endian uint16)
+   - `[55..]`   credentialId, then credentialPublicKey (CBOR COSE_Key)
+5. `cbor_parse_cose_key` → x[32], y[32]; verify `alg == -7` (ES256)
+6. `cose_key_to_der` — prepend 27-byte SPKI_PREFIX to x+y → 91-byte DER
+7. `db_user_create` (idempotent upsert); `db_cred_store`
+
+### ECDSA-P256 Key Format (`src/crypto.c`)
+
+91-byte SubjectPublicKeyInfo DER built by prepending a hardcoded 27-byte prefix:
+
 ```c
 static const uint8_t SPKI_PREFIX[27] = {
     0x30,0x59, 0x30,0x13,
-    0x06,0x07, 0x2a,0x86,0x48,0xce,0x3d,0x02,0x01,  // ecPublicKey OID
-    0x06,0x08, 0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x07, // prime256v1 OID
-    0x03,0x42,0x00, 0x04  // BIT STRING + uncompressed point marker
+    0x06,0x07, 0x2a,0x86,0x48,0xce,0x3d,0x02,0x01,       // ecPublicKey OID
+    0x06,0x08, 0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x07,  // prime256v1 OID
+    0x03,0x42,0x00, 0x04                                   // BIT STRING + uncompressed point
 };
 ```
 
-**ecdsa_p256_verify**: OpenSSL EVP high-level API (no deprecation warnings on OpenSSL 3):
-```c
-EVP_PKEY *pkey = d2i_PUBKEY_ex(NULL, &p, der_len, NULL, NULL);
-EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-EVP_DigestVerifyInit(ctx, NULL, EVP_sha256(), NULL, pkey);
-EVP_DigestVerifyUpdate(ctx, msg, msg_len);
-rc = EVP_DigestVerifyFinal(ctx, sig_der, sig_len);  // 1 = valid
-```
-
-Big-endian helpers (authData fields are big-endian on little-endian Apple Silicon):
-```c
-static uint32_t be32(const uint8_t *p);
-static uint16_t be16(const uint8_t *p);
-```
-
-### 3. src/cbor.c — No dependencies on other src files
-
-Minimal recursive decoder for: unsigned int (major 0), negative int (major 1), byte string (major 2), text string (major 3), map (major 5). Additional info ≤ 23, 24, 25, 26 (no 64-bit args or indefinite lengths needed).
-
-Key types:
-```c
-typedef enum { CBOR_UINT, CBOR_NEGINT, CBOR_BYTES, CBOR_TEXT, CBOR_MAP } cbor_type_t;
-typedef struct cbor_value { cbor_type_t type; union { ... }; } cbor_value_t;
-int cbor_decode_one(const uint8_t *buf, size_t len, cbor_value_t *out); // returns bytes consumed
-int cbor_skip(const uint8_t *buf, size_t len);  // skip one complete item (recursive for maps)
-int cbor_parse_attestation_object(buf, len, &auth_data_ptr, &auth_data_len, fmt_out);
-int cbor_parse_cose_key(buf, len, x[32], y[32], *alg);  // extracts COSE labels -2,-3
-```
-
-COSE key labels: integer key `-2` → x (32 bytes), `-3` → y (32 bytes), `3` → alg (-7 = ES256). CBOR encodes `-2` as major type 1, argument 1 (since `-1 - 1 = -2`).
-
-### 4. src/db.c
-
-All queries use `sqlite3_prepare_v2` + `sqlite3_bind_*` + `sqlite3_step` + `sqlite3_finalize`. Never `sqlite3_exec` with user data.
-
-Key functions: `db_init`, `db_close`, `db_user_create` (upsert-safe), `db_user_find`, `db_cred_store`, `db_cred_find` (returns heap-allocated `pub_key_der` — caller must `free()`), `db_cred_update_sign_count`, `db_creds_for_user` (callback-based iterator), `db_challenge_store`, `db_challenge_consume` (atomic find+delete, checks expiry).
-
-### 5. src/webauthn.c
-
-Config constants at top of file:
-```c
-#define RP_ID   "localhost"
-#define RP_NAME "C Passkey Demo"
-#define ORIGIN  "http://localhost:8080"
-#define CHAL_TTL 300
-```
-
-**webauthn_begin_registration(db, username)**:
-1. Generate 32 random bytes via `mg_random(challenge, 32)`
-2. `db_challenge_store(db, challenge, username, "registration", time(NULL)+CHAL_TTL)`
-3. Return cJSON options: `{challenge, rp:{id,name}, user:{id,name,displayName}, pubKeyCredParams:[{type,alg:-7}], timeout:60000, attestation:"none"}`
-
-**webauthn_verify_registration(db, credential_json, err_out)**:
-1. base64url-decode `response.clientDataJSON`; parse JSON; verify `type=="webauthn.create"`, `origin==ORIGIN`
-2. base64url-decode `challenge` from clientDataJSON; `db_challenge_consume(..., "registration")`
-3. `sha256(raw_cdj, len, client_data_hash)` (not needed for "none" attestation but computed for completeness)
-4. base64url-decode `response.attestationObject`; `cbor_parse_attestation_object` → `auth_data` bytes
-5. Parse authData binary layout:
-   - `[0..31]` = rpIdHash; verify == `sha256("localhost")`
-   - `[32]` = flags; verify `flags & 0x01` (UP) is set; verify `flags & 0x40` (AT) for attested cred data
-   - `[33..36]` = signCount (be32)
-   - `[37..52]` = AAGUID (16 bytes)
-   - `[53..54]` = credentialIdLength (be16)
-   - `[55..55+credIdLen-1]` = credentialId
-   - `[55+credIdLen..]` = credentialPublicKey (CBOR)
-6. `cbor_parse_cose_key` → x, y; verify `alg == -7`
-7. `cose_key_to_der(x, y, pub_key_der, &der_len)`
-8. `db_user_create` (idempotent); `db_cred_store`
-
-**webauthn_begin_authentication(db, username)**:
-1. `db_user_find` to get user_id; `db_creds_for_user` to collect credential IDs
-2. Generate challenge; `db_challenge_store(..., "authentication")`
-3. Return cJSON options: `{challenge, allowCredentials:[{type:"public-key", id:base64url(cred_id)},...], timeout:60000, userVerification:"preferred"}`
-
-**webauthn_verify_authentication(db, assertion_json, err_out)** → returns username or NULL:
-1. base64url-decode `rawId` → cred_id; `db_cred_find` → pub_key_der, stored_sign_count
-2. base64url-decode + parse clientDataJSON; verify `type=="webauthn.get"`, `origin`
-3. `db_challenge_consume(..., "authentication")` → username
-4. base64url-decode `response.authenticatorData`; parse header; verify rpIdHash, UP flag
-5. `new_sign_count = be32(auth_data+33)`; if `new_sign_count > 0`: verify `> stored_sign_count`
-6. `message = auth_data || sha256(raw_clientDataJSON)`
-7. base64url-decode `response.signature`; `ecdsa_p256_verify(pub_key_der, ..., message, ..., sig, ...)`
-8. `db_cred_update_sign_count`; `free(pub_key_der)`; return username
-
-### 6. src/handlers.c
-
-Mongoose event handler dispatches on `hm->uri`:
-- `POST /api/register/begin` → `handle_register_begin`
-- `POST /api/register/complete` → `handle_register_complete`
-- `POST /api/auth/begin` → `handle_auth_begin`
-- `POST /api/auth/complete` → `handle_auth_complete`
-- `OPTIONS *` → 204 with CORS headers (browser preflight)
-- Everything else → `mg_http_serve_dir(c, hm, &(struct mg_http_serve_opts){.root_dir="./frontend"})`
-
-All API responses include `Content-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n`.
-
-**Important**: `hm->body.buf` is NOT null-terminated — always `strndup(hm->body.buf, hm->body.len)` before `cJSON_Parse`.
-
-`app_ctx_t` holds the `db_ctx_t*` and is passed via `mg_http_listen`'s `fn_data` → `c->fn_data`.
-
-### 7. src/main.c
-
-Parse `--port` and `--db` argv args; `db_init`; `mg_mgr_init`; `mg_http_listen(..., http_event_handler, &app)`; `for(;;) mg_mgr_poll(&mgr, 1000)`.
-
-### 8. frontend/index.html + app.js
-
-Two sections: Register and Login. No framework dependencies. Script loaded as `type="module"` (strict mode + module scope, no global pollution).
-
-Key JS helpers:
-```js
-function bufferToBase64url(buf) { /* Uint8Array → btoa → replace +/ with -_ → strip = */ }
-function base64urlToBuffer(b64) { /* replace -_ → +/ → pad → atob → Uint8Array → ArrayBuffer */ }
-async function apiPost(endpoint, payload) { /* shared fetch helper — checks resp.ok before .json() */ }
-function checkSupport(statusId) { /* guards on window.PublicKeyCredential before each flow */ }
-```
-
-Registration flow: `checkSupport` → `apiPost('/api/register/begin')` → transform `challenge` and `user.id` to `ArrayBuffer` → `navigator.credentials.create({publicKey: options})` → serialize buffers to base64url (including `getTransports()`) → `apiPost('/api/register/complete')`.
-
-Authentication flow: `checkSupport` → `apiPost('/api/auth/begin')` → transform `challenge` and `allowCredentials[].id` to `ArrayBuffer` → `navigator.credentials.get({publicKey: options})` → serialize → `apiPost('/api/auth/complete')`.
-
----
+Verification uses OpenSSL 3 EVP high-level API (no deprecated EC_KEY functions):
+`d2i_PUBKEY_ex` → `EVP_DigestVerifyInit/Update/Final`
 
 ## Key Traps
 
-1. **Big-endian in authData**: `signCount` (offset 33, uint32) and `credentialIdLength` (offset 53, uint16) are big-endian. Use `be32`/`be16` helpers.
-2. **base64url ≠ base64**: Mongoose's decoder handles standard base64 only. Must write our own (table with `-`→62, `_`→63, no padding required).
-3. **"none" attestation**: `attStmt` is an empty CBOR map `{}` — no signature to verify. This is what browsers produce; just parse authData.
-4. **COSE negative int labels**: CBOR major type 1 encodes -2 as argument=1, -3 as argument=2. The `negint` field stores the mathematical value directly.
-5. **OpenSSL 3 API**: Use EVP high-level API (`d2i_PUBKEY_ex`, `EVP_DigestVerify*`) — no deprecated EC_KEY functions.
-6. **challenge in clientDataJSON**: The browser base64url-encodes the challenge when embedding it in clientDataJSON. Decode before comparing to DB value.
-7. **`db_cred_find` allocates**: Caller must `free(pub_key_der)` after use.
-
----
-
-## QA Findings (applied)
-
-Issues identified during review of `frontend/app.js` and resolved:
-
-1. **WebAuthn feature detection** — added `checkSupport()` guard checking `window.PublicKeyCredential` at the start of each button handler; fails gracefully with a readable message on unsupported browsers or non-secure contexts.
-2. **Fragile JSON parsing on complete steps** — both complete steps now go through `apiPost()` which checks `resp.ok` before calling `.json()`, so a non-JSON 500 response no longer throws an opaque parse error.
-3. **Authenticator transports** — registration payload now includes `transports: cred.response.getTransports ? cred.response.getTransports() : []`, which is required by strict server libraries and improves future credential lookup.
-4. **Repetitive fetch boilerplate** — extracted shared `apiPost(endpoint, payload)` helper used by all four API calls.
-5. **Global scope pollution** — script tag changed to `type="module"`; all functions are now module-scoped.
-
-6. **Discoverable credentials backend** — `db_user_find_by_id()` added; `webauthn_begin_authentication()` now accepts NULL username (stores `""` challenge, returns empty `allowCredentials`); `webauthn_verify_authentication()` resolves username from credential when challenge carries no username; `handle_auth_begin()` makes username field optional.
-
-Frontend-side conditional UI (`mediation: "conditional"` on `navigator.credentials.get()`, optional username input) remains as future work.
-
----
+1. **Big-endian in authData**: `signCount` (offset 33, uint32) and `credentialIdLength`
+   (offset 53, uint16) are big-endian. Use `be32`/`be16` helpers.
+2. **base64url ≠ base64**: Mongoose decodes standard base64 only. Custom table-driven
+   decoder handles `-`→62, `_`→63, no padding required.
+3. **"none" attestation**: `attStmt` is an empty CBOR map — no signature to verify.
+4. **COSE negative int labels**: CBOR encodes -2 as major type 1, argument 1.
+5. **challenge in clientDataJSON**: browser base64url-encodes it — decode before
+   comparing to DB value.
+6. **`db_cred_find` allocates**: caller must `free(pub_key_der)` after use.
+7. **`hm->body.buf` is NOT null-terminated**: always `strndup(hm->body.buf, hm->body.len)`
+   before `cJSON_Parse`.
 
 ## Verification
 
-1. `make vendor-fetch && make` — should compile cleanly with no warnings
-2. `./passkey-server` — server starts on port 8080
-3. Open `http://localhost:8080` in Chrome/Safari/Firefox
-4. Register with a username → browser prompts for Touch ID/Face ID/Windows Hello → status shows "Registered!"
-5. Login with the same username → browser prompts for passkey → status shows "Logged in! Token: ..."
-6. Attempt login with wrong username → error returned
-7. Check `passkeys.db` with `sqlite3 passkeys.db "SELECT * FROM credentials;"` to confirm credential stored
+```bash
+make && ./passkey-server
+# Open http://localhost:8080 in Chrome/Safari
+# Register → browser Touch ID/Face ID/Windows Hello prompt → "Passkey registered!"
+# Login (named)      → type username, click Login → passkey prompt → "Logged in as alice!"
+# Login (discoverable) → leave username blank, click Login → browser modal
+# Login (conditional UI) → click username field → browser autofill dropdown
+sqlite3 passkeys.db \
+  "SELECT u.username, hex(c.credential_id) \
+   FROM credentials c JOIN users u ON u.id = c.user_id;"
+```
