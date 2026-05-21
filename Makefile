@@ -17,6 +17,7 @@ all: $(TARGET)
 
 $(TARGET): $(OBJS)
 	$(CC) $(OBJS) $(LDFLAGS) -o $@
+	rm -f $(OBJS)
 
 vendor/sqlite3.o: vendor/sqlite3.c
 	$(CC) -std=c99 -O2 \
